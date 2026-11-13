@@ -1,0 +1,297 @@
+# aarch64 / CUDA 13 variant of the Hickory image (e.g. NVIDIA GB10 / DGX Spark, sm_121).
+# The default Dockerfile targets x86_64 + CUDA 12.1 + torch 2.5.1, none of which
+# have aarch64 / Blackwell builds. Differences here: environment.aarch64.yml
+# (CUDA 13 toolkit, torch 2.9.1+cu130), sbsa-linux CUDA target paths, arch 12.1,
+# warp-lang 1.6.2 (newest wheel compatible with the base image glibc; supports sm_121),
+# and spconv / kaolin built from source (no aarch64 wheels; see steps at the end).
+FROM condaforge/miniforge3:24.11.3-0
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG INSTALL_EXTERNAL_DEPS=0
+ARG INSTALL_SAM3D_RUNTIME_DEPS=1
+ARG INSTALL_FOUNDATIONPOSE_RUNTIME_DEPS=0
+ARG INSTALL_CLIPPER=1
+ARG INSTALL_SAM2=0
+ARG SAM2_COMMIT=2b90b9f5ceec907a1c18123530e92e794ad901a4
+ARG CLIPPER_COMMIT=0666d38db21c9e30ea666de6d503efe32a017daa
+ARG OPENAI_CLIP_COMMIT=a1d071733d7111c9c014f024669f959182114e33
+ARG FASTSAM_COMMIT=4d153e909f0ad9c8ecd7632566e5a24e21cf0071
+ARG NVDIFFRAST_REF=v0.4.0
+
+ENV TZ=Etc/UTC \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    ROMAN_WEIGHTS=/workspace/weights \
+    TORCH_HOME=/workspace/weights/torch \
+    HF_HOME=/workspace/weights/huggingface \
+    TRANSFORMERS_CACHE=/workspace/weights/huggingface/transformers \
+    XDG_CACHE_HOME=/workspace/weights/cache \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    bzip2 \
+    ca-certificates \
+    cmake \
+    curl \
+    ffmpeg \
+    git \
+    libeigen3-dev \
+    libegl1 \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libsm6 \
+    libxext6 \
+    libxkbcommon-x11-0 \
+    libxrender1 \
+    lsb-release \
+    mesa-utils \
+    ninja-build \
+    pkg-config \
+    wget \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/opt/conda/bin:/opt/conda/envs/hickory/bin:$PATH \
+    CONDA_DEFAULT_ENV=hickory \
+    CUDA_HOME=/opt/conda/envs/hickory \
+    FORCE_CUDA=1 \
+    CUDA_ARCH="12.1" \
+    NATTEN_CUDA_ARCH="12.1" \
+    NATTEN_N_WORKERS=4 \
+    NATTEN_WITH_CUDA=1 \
+    MAX_JOBS=4 \
+    TORCH_CUDA_ARCH_LIST="12.1" \
+    LD_LIBRARY_PATH=/opt/conda/envs/hickory/lib
+
+WORKDIR /workspace
+
+COPY environment.aarch64.yml requirements.txt pyproject.toml README.md main.py ./
+COPY hickory ./hickory
+COPY params ./params
+COPY third_party/mps ./third_party/mps
+COPY third_party/roman ./third_party/roman
+COPY third_party/FoundationPose ./third_party/FoundationPose
+COPY third_party/sam-3d-objects ./third_party/sam-3d-objects
+
+RUN mamba env create -f environment.aarch64.yml \
+    && mamba clean -afy \
+    && /opt/conda/envs/hickory/bin/python -m pip install -e .
+
+# natten 0.14.6 (required by transformers' DiNAT/OneFormer) does not compile its
+# CPU kernels against torch 2.9 headers: at::vec::map2<double> resolves to the
+# reduced-float overload. Replace the two map2 calls with an equivalent scalar
+# loop (o[d] += attn * v[d]). Only CPU kernels are affected; CUDA kernels are untouched.
+RUN mkdir -p /opt/natten-src && cd /opt/natten-src \
+    && /opt/conda/envs/hickory/bin/python -m pip download natten==0.14.6 \
+         --no-deps --no-binary :all: --no-build-isolation -d . \
+    && tar xzf natten-0.14.6.tar.gz \
+    && sed -i 's|at::vec::map2(\[a\](Vec& x, Vec& y) { return fmadd(a, x, y); }, _oaddr, _vaddr, _oaddr, dim);|for (int64_t _d = 0; _d < dim; ++_d) _oaddr[_d] = attn.data()[attnOffset] * _vaddr[_d] + _oaddr[_d];|' \
+         natten-0.14.6/src/natten/csrc/cpu/natten1dav_cpu_kernel.cpp \
+         natten-0.14.6/src/natten/csrc/cpu/natten2dav_cpu_kernel.cpp \
+    && ! grep -n "vec::map2" natten-0.14.6/src/natten/csrc/cpu/*.cpp \
+    && CUDA_HOME=/opt/conda/envs/hickory \
+       FORCE_CUDA=1 \
+       NATTEN_CUDA_ARCH="12.1" \
+       NATTEN_N_WORKERS=4 \
+       NATTEN_WITH_CUDA=1 \
+       MAX_JOBS=4 \
+       /opt/conda/envs/hickory/bin/python -m pip install --no-build-isolation --no-cache-dir ./natten-0.14.6 \
+    && cd / && rm -rf /opt/natten-src
+
+RUN /opt/conda/envs/hickory/bin/python -m pip install --no-build-isolation \
+      "clip @ git+https://github.com/openai/CLIP.git@${OPENAI_CLIP_COMMIT}" \
+    && /opt/conda/envs/hickory/bin/python -m pip install --no-deps \
+      "fastsam @ git+https://github.com/CASIA-IVA-Lab/FastSAM.git@${FASTSAM_COMMIT}" \
+    && /opt/conda/envs/hickory/bin/python -c "import natten, clip; from fastsam import FastSAM; print('natten, clip, and fastsam installed')"
+
+# pymeshfix assumes signed char (x86 default); char is unsigned on aarch64, so build with -fsigned-char.
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      CFLAGS="-fsigned-char" CXXFLAGS="-fsigned-char" \
+      /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir --no-deps \
+        "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900" \
+        gradio_client==0.2.9 \
+        optree==0.14.1 \
+        astor==0.8.1 \
+        easydict==1.13 \
+        plyfile==1.1.3 \
+        pymeshfix==0.17.0 ; \
+    fi
+
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir \
+        lightning==2.3.3 \
+        igraph==0.11.8 ; \
+    fi
+
+# CUDA 13 nvcc defaults to -static-global-template-stub=true, which breaks pytorch3d pulsar
+# kernels instantiated across translation units (nvcc warning #20280-D); turn it off as nvcc advises.
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      CUDA_HOME=/opt/conda/envs/hickory \
+      C_INCLUDE_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/include:${C_INCLUDE_PATH} \
+      CPLUS_INCLUDE_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/include:${CPLUS_INCLUDE_PATH} \
+      LIBRARY_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/lib:${LIBRARY_PATH} \
+      LD_LIBRARY_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/lib:${LD_LIBRARY_PATH} \
+      MAX_JOBS=4 \
+      FORCE_CUDA=1 \
+      NVCC_FLAGS="-static-global-template-stub=false" \
+      /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir --no-build-isolation \
+        "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47" ; \
+    fi
+
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir --no-build-isolation --no-deps \
+        --extra-index-url https://pypi.ngc.nvidia.com \
+        "MoGe @ git+https://github.com/microsoft/MoGe.git@a8c37341bc0325ca99b9d57981cc3bb2bd3e255b" ; \
+    fi
+
+RUN sed -i "s/find_package(Boost REQUIRED COMPONENTS system program_options)/find_package(Boost REQUIRED)/" \
+        third_party/FoundationPose/mycpp/CMakeLists.txt \
+      && sed -i "s/ \${Boost_LIBRARIES}//" \
+        third_party/FoundationPose/mycpp/CMakeLists.txt \
+      && sed -i "/include_directories(/a\\  /usr/include" \
+        third_party/FoundationPose/mycpp/CMakeLists.txt \
+      && sed -i "/find_package(OpenMP REQUIRED)/d; s/ \${OpenMP_CXX_FLAGS}//" \
+        third_party/FoundationPose/mycpp/CMakeLists.txt \
+      && sed -i "/#include <omp.h>/d" \
+        third_party/FoundationPose/mycpp/include/Utils.h \
+      && sed -i "s/^from gsplat import rasterization$/try:\\n    from gsplat import rasterization\\nexcept ImportError:\\n    rasterization = None/" \
+        third_party/sam-3d-objects/sam3d_objects/model/backbone/tdfy_dit/renderers/gaussian_render.py \
+      && sed -i "/See reference code to convert from gsplat to inria:/i\\        if rasterization is None:\\n            raise ImportError('gsplat is required for the SAM3D Gaussian renderer backend.')" \
+        third_party/sam-3d-objects/sam3d_objects/model/backbone/tdfy_dit/renderers/gaussian_render.py
+
+COPY hickory/reconstruction/fp_demo.py /tmp/hickory_foundationpose_run_demo.py
+COPY hickory/reconstruction/sam3d_inference.py /tmp/hickory_sam3d_inference.py
+RUN cp /tmp/hickory_foundationpose_run_demo.py third_party/FoundationPose/run_demo.py \
+      && cp /tmp/hickory_sam3d_inference.py third_party/sam-3d-objects/notebook/inference.py
+
+RUN if [ "${INSTALL_FOUNDATIONPOSE_RUNTIME_DEPS}" = "1" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends \
+        libegl1-mesa-dev \
+        libgles2-mesa-dev \
+        libgl1-mesa-dev \
+        libglvnd-dev \
+        libboost-dev \
+      && rm -rf /var/lib/apt/lists/* \
+      && /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir \
+        pybind11==2.12.0 \
+        ruamel.yaml==0.18.6 \
+        kornia==0.7.2 \
+        transformations==2024.6.1 \
+        warp-lang==1.6.2 \
+        h5py==3.10.0 \
+        psutil \
+        joblib \
+        "pyOpenGL>=3.1.0" \
+        "pyOpenGL_accelerate>=3.1.0" \
+      && CUDA_HOME=/opt/conda/envs/hickory \
+        C_INCLUDE_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/include:${C_INCLUDE_PATH} \
+        CPLUS_INCLUDE_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/include:${CPLUS_INCLUDE_PATH} \
+        LIBRARY_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/lib:${LIBRARY_PATH} \
+        LD_LIBRARY_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/lib:${LD_LIBRARY_PATH} \
+        MAX_JOBS=4 \
+        /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir --no-build-isolation \
+        "git+https://github.com/NVlabs/nvdiffrast.git@${NVDIFFRAST_REF}" \
+      && CC=/usr/bin/gcc \
+        CXX=/usr/bin/g++ \
+        CMAKE_PREFIX_PATH=/opt/conda/envs/hickory/lib/python3.11/site-packages/pybind11/share/cmake/pybind11 \
+        cmake -S third_party/FoundationPose/mycpp -B third_party/FoundationPose/mycpp/build \
+          -DPYTHON_EXECUTABLE=/opt/conda/envs/hickory/bin/python \
+          -DPYTHON_LIBRARY=/opt/conda/envs/hickory/lib/libpython3.11.so \
+          -DPYTHON_INCLUDE_DIR=/opt/conda/envs/hickory/include/python3.11 \
+      && CC=/usr/bin/gcc \
+        CXX=/usr/bin/g++ \
+        cmake --build third_party/FoundationPose/mycpp/build --parallel 4 \
+      && /opt/conda/envs/hickory/bin/python -c "import nvdiffrast.torch; import pytorch3d; import kornia; import ruamel.yaml; print('FoundationPose runtime deps OK')" ; \
+    fi
+
+RUN if [ "${INSTALL_SAM2}" = "1" ]; then \
+      git clone https://github.com/facebookresearch/sam2.git third_party/sam2 \
+      && git -C third_party/sam2 checkout "${SAM2_COMMIT}" \
+      && /opt/conda/envs/hickory/bin/python -m pip install -e third_party/sam2 ; \
+    fi
+
+# clipper/src/sdp.cpp uses assert() without <cassert>; not pulled in transitively on aarch64.
+RUN if [ "${INSTALL_CLIPPER}" = "1" ]; then \
+      git clone https://github.com/mit-acl/clipper.git /opt/clipper \
+      && git -C /opt/clipper checkout "${CLIPPER_COMMIT}" \
+      && cmake -S /opt/clipper -B /opt/clipper/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_FLAGS="-include cassert" \
+        -DCLIPPER_BUILD_BINDINGS_PYTHON=ON \
+        -DCLIPPER_BUILD_BINDINGS_MATLAB=OFF \
+        -DCLIPPER_BUILD_TESTS=OFF \
+        -DCLIPPER_BUILD_BENCHMARKS=OFF \
+        -DCLIPPER_ENABLE_MKL=OFF \
+        -DCLIPPER_ENABLE_BLAS=OFF \
+        -DCLIPPER_ENABLE_SCS_SDR=OFF \
+        -DPYTHON_EXECUTABLE=/opt/conda/envs/hickory/bin/python \
+      && cmake --build /opt/clipper/build --target pip-install --parallel "$(nproc)" \
+      && /opt/conda/envs/hickory/bin/python -c "import clipperpy; print('clipperpy OK')" ; \
+    fi
+
+RUN if [ "${INSTALL_EXTERNAL_DEPS}" = "1" ]; then \
+      /opt/conda/envs/hickory/bin/python -m pip install -r third_party/FoundationPose/requirements.txt \
+      && /opt/conda/envs/hickory/bin/python -m pip install -e third_party/sam-3d-objects \
+      && /opt/conda/envs/hickory/bin/python -m pip install -r third_party/sam-3d-objects/requirements.inference.txt ; \
+    fi
+
+# --- SAM3D sparse/geometry deps with no aarch64 wheels: built from source ---
+# kaolin: 0.17.0 uses AT_DISPATCH(x.type()) removed in torch 2.9; use the 0.18.0 master commit.
+ARG KAOLIN_COMMIT=ee8b7ec
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      git clone https://github.com/NVIDIAGameWorks/kaolin.git /opt/kaolin \
+      && git -C /opt/kaolin checkout "${KAOLIN_COMMIT}" \
+      && /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir cython \
+      && CUDA_HOME=/opt/conda/envs/hickory \
+         CPLUS_INCLUDE_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/include \
+         LIBRARY_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/lib \
+         IGNORE_TORCH_VER=1 TORCH_CUDA_ARCH_LIST="12.1" FORCE_CUDA=1 MAX_JOBS=8 \
+         NVCC_FLAGS="-static-global-template-stub=false" \
+         /opt/conda/envs/hickory/bin/python -m pip install --no-cache-dir --no-build-isolation /opt/kaolin \
+      && rm -rf /opt/kaolin ; \
+    fi
+
+# spconv 2.3.8 + cumm (master d971d02 = first with sm_12x support). spconv declares cumm<0.8.0, but
+# cumm 0.7.x has no Blackwell archs, so the pin is bypassed with --no-deps (verified by a GPU run below).
+# Kernels are prebuilt for sm_121 only (CUMM_CUDA_ARCH_LIST); other GPUs would fall back to failing NVRTC.
+ARG CUMM_COMMIT=d971d02a0b29b7e6da46186564f37bde77b99dcc
+COPY docker/patch_cumm_aarch64.py /tmp/patch_cumm_aarch64.py
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      P=/opt/conda/envs/hickory/bin/python \
+      && git clone https://github.com/FindDefinition/cumm.git /opt/cumm \
+      && git -C /opt/cumm checkout "${CUMM_COMMIT}" \
+      && git clone https://github.com/traveller59/spconv.git /opt/spconv \
+      && git -C /opt/spconv checkout v2.3.8 \
+      && $P /tmp/patch_cumm_aarch64.py /opt/cumm /opt/spconv \
+      && $P -m pip install --no-cache-dir pccm ccimport pybind11 fire sympy lark portalocker ninja \
+      && export CUDA_HOME=/opt/conda/envs/hickory \
+         CPLUS_INCLUDE_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/include \
+         LIBRARY_PATH=/opt/conda/envs/hickory/targets/sbsa-linux/lib \
+         CUMM_CUDA_VERSION=13.0 CUMM_CUDA_ARCH_LIST="12.1" CUMM_DISABLE_JIT=1 SPCONV_DISABLE_JIT=1 MAX_JOBS=8 \
+      && $P -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/cumm \
+      && $P -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/spconv \
+      && rm -rf /opt/cumm /opt/spconv ; \
+    fi
+
+# igraph's manylinux wheel bundles its own libgomp; on aarch64 loading it after torch fails with
+# "cannot allocate memory in static TLS block" (SAM3D imports igraph late). Build it from source so it
+# links the environment's single libgomp. The base image's cmake (3.16) is too old for igraph's C core,
+# so a pip cmake is used for this step only.
+RUN if [ "${INSTALL_SAM3D_RUNTIME_DEPS}" = "1" ]; then \
+      P=/opt/conda/envs/hickory/bin/python \
+      && $P -m pip install --no-cache-dir cmake ninja "setuptools<80" wheel setuptools_scm "packaging<25" \
+      && $P -m pip install --no-cache-dir --no-build-isolation --no-binary igraph --force-reinstall --no-deps igraph==0.11.8 \
+      && $P -m pip uninstall -y cmake \
+      && $P -c "import igraph; print('igraph', igraph.__version__)" ; \
+    fi
+
+COPY docker/entrypoint.sh /usr/local/bin/hickory-entrypoint
+RUN chmod +x /usr/local/bin/hickory-entrypoint \
+    && mkdir -p /workspace/weights /workspace/dataset /workspace/reconstruction
+
+ENTRYPOINT ["hickory-entrypoint"]
+CMD ["python", "main.py", "--help"]

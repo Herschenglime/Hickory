@@ -60,3 +60,4 @@ third_party/sam2/
 *.tar
 *.tar.gz
 *.zip
+datasets

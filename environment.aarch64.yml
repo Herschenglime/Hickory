@@ -1,0 +1,65 @@
+name: hickory
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - cuda-toolkit=13.0
+  - numpy=1.26
+  - scipy
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - pyyaml
+  - pillow
+  - tqdm
+  # No aarch64 wheel on PyPI; conda-forge ships linux-aarch64 builds.
+  - pycolmap
+  - pip:
+      - setuptools<80
+      - wheel
+      - numpy==1.26.4
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.9.1+cu130
+      - torchvision==0.24.1
+      - torchaudio==2.9.1
+      - opencv-python==4.9.0.80
+      - open3d==0.18.0
+      - trimesh==4.11.0
+      - pyvista
+      - mesh2sdf
+      - evo
+      - rosbags
+      - rosbags-image
+      - gtsam
+      - robotdatapy
+      - yolov7-package==0.0.13
+      - imageio
+      - plotly
+      - pyrender
+      - pyglet==2.1.12
+      - rtree
+      - xatlas
+      - fvcore
+      - hydra-core
+      - omegaconf
+      - einops
+      - timm
+      - transformers==4.39.3
+      - ultralytics==8.0.120
+      - shapely
+      - geomloss
+      - loguru
+      - pycocotools
+      - pandas
+      - seaborn
+      - ftfy
+      - regex
+      - requests
+      - wget
+      - gradio==3.35.2
+      - natsort
+      - pyquaternion
+      - -e .
+      # third_party/mps/requirements.txt is covered above (pycolmap via conda).

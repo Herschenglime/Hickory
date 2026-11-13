@@ -1,0 +1,11 @@
+# Override for aarch64 + CUDA 13 hosts (e.g. NVIDIA GB10 / DGX Spark).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.aarch64.yml build hickory
+#        docker compose -f docker-compose.yml -f docker-compose.aarch64.yml run --rm hickory python main.py ...
+services:
+  hickory:
+    build:
+      dockerfile: Dockerfile.aarch64
+    image: hickory:aarch64
+    environment:
+      CUDA_ARCH: "12.1"
+      NATTEN_CUDA_ARCH: "12.1"
