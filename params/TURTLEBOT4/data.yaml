@@ -1,0 +1,43 @@
+# DRAFT, untested on real data. Template for a ROS 2 (Jazzy) rosbag2 recording from a mobile robot with an RGB-D camera.
+# Every topic name and frame below is a PLACEHOLDER: replace <ns> and the names from the real robot.
+# What each field must satisfy is in docs/turtlebot4-collection-procedure.md, section 1.
+# Usage: main.py params/TURTLEBOT4/data.yaml --param params/TURTLEBOT4/ --output-dir reconstruction/TURTLEBOT4/run1
+dt: 0.25    # sampling period in seconds, and also the RGB/depth sync tolerance; the extractor additionally caps processing at 6 frames/s
+
+img_data:
+  path: "dataset/TURTLEBOT4/run1"                   # bag directory (contains metadata.yaml); .mcap and .db3 both work
+  topic: /<ns>/<rgb image topic>                    # raw sensor_msgs/Image or CompressedImage
+  camera_info_topic: /<ns>/<rgb camera_info topic>
+  compressed: True                                  # True for a CompressedImage topic, False for raw Image
+
+depth_data:
+  path: "dataset/TURTLEBOT4/run1"
+  topic: /<ns>/<depth image topic>                  # metric depth registered to the RGB camera, same resolution
+  camera_info_topic: /<ns>/<depth camera_info topic>
+  compressed: False
+# depth units are set by depth_scale in fastsam.yaml (1000.0 for uint16 millimetres, 1.0 for float metres)
+
+pose_data:
+  # Variant A: Odometry / PoseStamped / Path topic
+  type: bag
+  path: "dataset/TURTLEBOT4/run1"
+  topic: /<ns>/<odometry topic>
+  time_tol: 1.0
+  # Variant B: poses from the tf tree (e.g. a localized map frame). Replace the four lines above with:
+  #   type: bag_tf
+  #   path: "dataset/TURTLEBOT4/run1"
+  #   parent_frame: map
+  #   child_frame: <ns>/base_link
+  #   tf_topic_namespace: <ns>           # reads /<ns>/tf and /<ns>/tf_static
+  #   time_tol: 1.0
+  T_camera_flu:                                     # parsed by the loader but not applied to the pose; the key is required
+    input_type: "string"
+    string: "T_RDFFLU"
+  T_odombase_camera:                                # the only extrinsic that is applied: T_WC = T_W_base @ T_odombase_camera
+    input_type: "string"                            # v1: camera at the base origin looking forward (rotation only, no mount offset)
+    string: "T_FLURDF"
+  # v2: the real camera mount. `input_type: tf` does NOT forward a namespace, so on a namespaced robot use a matrix:
+  # T_odombase_camera:
+  #   input_type: "matrix"
+  #   matrix: [r00, r01, r02, tx,  r10, r11, r12, ty,  r20, r21, r22, tz,  0, 0, 0, 1]   # from check_bag_standalone.py --extrinsic tf
+  # (on an un-namespaced robot: input_type "tf", parent: base_link, child: <optical frame>, inv: false/true)

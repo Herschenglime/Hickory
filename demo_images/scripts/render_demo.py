@@ -1,6 +1,6 @@
 """Headless demo renders for a Hickory output dir (run inside the container).
 
-usage: python render_demo.py <objects_dir> <out_dir> <tag>
+usage: python render_demo.py <objects_dir> <out_dir> <tag> [yup|zup]   (dataset world frame: REPLICA is y-up (default), HOPE is z-up)
 Poses: pose_foundation.txt (T_CO, FoundationPose-refined) -> T_WO = T_WC @ T_CO,
 same convention as hickory/visualization/scene.py with --pose-source fp.
 """
@@ -23,7 +23,8 @@ from hickory.visualization.scene import load_transform, load_camera_pose, superq
 root, out, tag = sys.argv[1], sys.argv[2], sys.argv[3]
 os.makedirs(out, exist_ok=True)
 cm = plt.get_cmap("tab20")
-DISP = np.array([[1.0, 0, 0], [0, 0, -1.0], [0, 1.0, 0]])  # after M (dataset-world, y up): plot z = y, plot y = -z
+UP = sys.argv[4] if len(sys.argv) > 4 else "yup"
+DISP = np.eye(3) if UP == "zup" else np.array([[1.0, 0, 0], [0, 0, -1.0], [0, 1.0, 0]])  # yup: plot z = y, plot y = -z; zup: already plot-ready
 LIGHT = np.array([0.4, -0.5, 0.8]); LIGHT /= np.linalg.norm(LIGHT)
 
 
