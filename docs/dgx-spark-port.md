@@ -8,8 +8,9 @@ document records what was changed, why, and what was measured.
 
 The stock `Dockerfile` targets x86_64 + CUDA 12.1 and cannot build on a DGX
 Spark (aarch64, Blackwell GB10 = sm_121, driver CUDA 13.0). This branch adds an
-aarch64 image variant and runs the **full pipeline end to end on REPLICA
-apt0/1 (41 objects) and apt0/2 (42 objects)**: extraction, SAM3D, FoundationPose,
+aarch64 image variant and runs the **full pipeline end to end on all eight
+REPLICA scenes (apt0 to apt3, two runs each, 41 to 51 objects) and the three
+HOPE scenes (10 to 19 objects)**: extraction, SAM3D, FoundationPose,
 superquadric (SQ) fitting and expansion, CLIPPER map alignment, and the
 navigation planner. The default Dockerfile and compose file are unchanged.
 
@@ -24,7 +25,7 @@ A full SAM3D + FoundationPose + SQ run takes roughly 25 minutes per 40 objects.
 
 ## Results
 
-All numbers are from this host, REPLICA scenes apt0/1 and apt0/2.
+All numbers are from this host. Scene-level detail for apt0 is below; the table after it covers all four apartments.
 
 | Check | Result |
 |---|---|
@@ -34,6 +35,20 @@ All numbers are from this host, REPLICA scenes apt0/1 and apt0/2.
 | Observed point cloud to posed SAM3D mesh | median 1.0 cm per object on apt0/1 (p90 5 cm); 1.2 cm on apt0/2 (p90 11 cm) |
 | Upstream FoundationPose demo (driller, 166 frames with reference poses) | 0.18 mm, 0.13 deg mean error |
 | SQs per object (apt0/1) | min 1, median 18, max 50, total 771 |
+| HOPE 0000 / 0001 / 0002 (real RGB-D, tabletop) | 10 / 19 / 18 objects, median 22 / 27 / 27 SQs each, point cloud to mesh median 0.1 to 0.2 cm; all stages completed on the first attempt |
+
+CLIPPER map alignment on all four ReplicaCAD apartments (two runs each), error
+against ground truth, next to the numbers in the paper (Table 3):
+
+| Scene | Objects (run 1 / run 2) | Associations | Ours | Paper |
+|---|---|---|---|---|
+| apt0 | 41 / 42 | 23 | 5.3 cm, 0.40 deg | 4.2 cm, 0.34 deg |
+| apt1 | 49 / 51 | 24 | 16.6 cm, 1.2 deg | 4.7 cm, 0.83 deg |
+| apt2 | 48 / 45 | 25 | 3.1 cm, 0.57 deg | 2.4 cm, 0.23 deg |
+| apt3 | 46 / 45 | 27 | 3.3 cm, 0.90 deg | 4.4 cm, 0.19 deg |
+
+The apt1 pair is the outlier (16.6 cm against 4.7 cm in the paper); the cause
+has not been investigated. Each scene was run once, and SAM3D is stochastic.
 
 Navigation, 10 random start/goal pairs on apt0/1, RRT planner, default `xz`
 ground plane:
@@ -98,18 +113,23 @@ checkpoints. Pinned upstream commits are listed in the README.
 
 ## Known issues
 
-- **Intermittent spconv crash.** One long SAM3D run died with
-  `cudaErrorIllegalAddress` in spconv's `sort_1d_by_key_allocator` (apt0/1,
-  object 28 of 41, after 27 successful objects in one process). It did not
-  reproduce on that object alone (also with `CUDA_LAUNCH_BLOCKING=1`) nor in the
-  resumed run, and apt0/2 ran 42 objects without it. Root cause not found. The
+- **Intermittent spconv crash.** SAM3D runs die with
+  `cudaErrorIllegalAddress` in spconv's `sort_1d_by_key_allocator`. Over the 11
+  scenes it hit 3 of the 8 REPLICA scenes (apt0/1 once, apt1/1 twice, apt2/1
+  once; four crashed attempts) and none of the 3 HOPE scenes. It is not tied to
+  an object count (after 27 objects, 28, 39, and in one case straight after
+  resuming), and not to an input: the same object crashed one fresh process and
+  passed the next. Host memory was not under pressure. The error surfaces at the
+  sort's synchronise call, which only reports an earlier asynchronous fault, so
+  the faulting kernel is unknown; `CUDA_LAUNCH_BLOCKING=1` was tried only on the
+  first, non-reproducing case. Root cause not found. The
   CUDA error is sticky, so `main.py`'s in-process retry cannot recover. Resume by
   re-running the same command with `--skip-extract`; finished objects are skipped.
 - **Bad pose.** apt0/1 `obj_019` (a thin, partially seen stool) is posed
   upside-down, so its SQs are too.
-- **Not run.** HOPE through SAM3D (HOPE extraction and FoundationPose weights
-  were verified separately), and the ROS-bag example (NUS-CLB data was
-  unavailable).
+- **Not run.** The ROS-bag example (NUS-CLB data was unavailable). A TurtleBot
+  procedure and bag checks were written and tested on synthetic bags only; see
+  `docs/turtlebot4-collection-procedure.md`.
 - `scene.py`, `alignment.py` and the interactive navigation picker are Open3D /
   matplotlib GUIs and need a display; the images here come from headless scripts.
 
